@@ -1,1 +1,12 @@
+com/example/LLMProvider$LLMResponse.class
+com/example/LLMProvider$Message.class
+com/example/MCPClient.class
+com/example/OpenAIProvider.class
+com/example/MCPServer.class
+com/example/AgentRuntime.class
+com/example/MCPServerInfo.class
+com/example/LLMProvider$ToolDefinition.class
 com/example/Main.class
+com/example/LLMProvider.class
+com/example/LLMProvider$ToolCall.class
+com/example/LLMProvider$ToolResult.class
