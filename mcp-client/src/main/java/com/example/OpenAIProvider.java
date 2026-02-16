@@ -38,16 +38,18 @@ public class OpenAIProvider implements LLMProvider {
     // ── LLMProvider interface ─────────────────────────────────────────────────
 
     @Override
-    public LLMResponse chat(List<Message> messages,
+    public LLMResponse chat(String systemPrompt,
+                            List<Message> messages,
                             List<ToolDefinition> tools) throws Exception {
 
-        ObjectNode body = buildRequestBody(messages, tools);
+        ObjectNode body = buildRequestBody(systemPrompt, messages, tools);
         JsonNode root   = callAPI(body);
         return parseResponse(root);
     }
 
     @Override
     public LLMResponse continueWithToolResults(
+            String           systemPrompt,
             List<Message>    messages,
             List<ToolResult> toolResults,
             List<Object>     previousOutputItems,
@@ -56,12 +58,16 @@ public class OpenAIProvider implements LLMProvider {
         ObjectNode body  = mapper.createObjectNode();
         body.put("model",       model);
         body.put("tool_choice", "auto");
+        body.set("tools",       buildOpenAITools(tools));
 
-        // Build the "tools" array for OpenAI
-        body.set("tools", buildOpenAITools(tools));
-
-        // Input = original messages + previous function_call items + tool results
         ArrayNode input = mapper.createArrayNode();
+
+        // System prompt goes first as a "developer" role message
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            input.add(mapper.createObjectNode()
+                    .put("role",    "developer")
+                    .put("content", systemPrompt));
+        }
 
         for (Message m : messages) {
             input.add(mapper.createObjectNode()
@@ -91,7 +97,8 @@ public class OpenAIProvider implements LLMProvider {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    private ObjectNode buildRequestBody(List<Message> messages,
+    private ObjectNode buildRequestBody(String systemPrompt,
+                                        List<Message> messages,
                                         List<ToolDefinition> tools) {
         ObjectNode body = mapper.createObjectNode();
         body.put("model",       model);
@@ -99,6 +106,14 @@ public class OpenAIProvider implements LLMProvider {
         body.set("tools",       buildOpenAITools(tools));
 
         ArrayNode input = mapper.createArrayNode();
+
+        // Inject system prompt as a "developer" role message (Responses API convention)
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            input.add(mapper.createObjectNode()
+                    .put("role",    "developer")
+                    .put("content", systemPrompt));
+        }
+
         for (Message m : messages) {
             input.add(mapper.createObjectNode()
                     .put("role",    m.role())

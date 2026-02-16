@@ -66,15 +66,22 @@ public interface LLMProvider {
     /**
      * Send the conversation so far plus available tool definitions.
      * Returns either a final text answer or a list of tool calls.
+     *
+     * @param systemPrompt optional system/developer-role message (null = omit)
      */
-    LLMResponse chat(List<Message> messages, List<ToolDefinition> tools) throws Exception;
+    LLMResponse chat(String systemPrompt,
+                     List<Message> messages,
+                     List<ToolDefinition> tools) throws Exception;
 
     /**
      * Continue the conversation after tool results have been collected.
      * The rawOutputItems from the previous LLMResponse are passed back along
      * with the tool results so the model has full context.
+     *
+     * @param systemPrompt optional system/developer-role message (null = omit)
      */
     LLMResponse continueWithToolResults(
+        String           systemPrompt,
         List<Message>    messages,
         List<ToolResult> toolResults,
         List<Object>     previousOutputItems,
