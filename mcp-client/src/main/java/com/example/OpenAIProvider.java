@@ -24,7 +24,7 @@ public class OpenAIProvider implements LLMProvider {
 
     private static final String RESPONSES_URL = "https://api.openai.com/v1/responses";
 
-    private final String     model;      // e.g. "gpt-4o", "gpt-4-turbo"
+    private final String     model;      // e.g. "gpt-4.1", "gpt-4-turbo"
     private final String     apiKey;
     private final HttpClient httpClient;
     private final ObjectMapper mapper = new ObjectMapper();

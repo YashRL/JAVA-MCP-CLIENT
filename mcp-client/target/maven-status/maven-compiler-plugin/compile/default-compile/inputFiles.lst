@@ -2,6 +2,9 @@
 /home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/Main.java
 /home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/LLMProvider.java
 /home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/AgentRuntime.java
+/home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/ReasoningStep.java
+/home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/Planner.java
 /home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/MCPServer.java
 /home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/MCPServerInfo.java
+/home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/PlanningMode.java
 /home/heer/Desktop/Java_Projects/Scripts/mcp-client/src/main/java/com/example/MCPClient.java

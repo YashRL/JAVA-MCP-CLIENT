@@ -4,65 +4,57 @@ import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.List;
 
-/**
- * Entry point for the MCP Java Agent.
- *
- * What happens when you run this:
- *  1. Three MCPClient instances are created (one per server endpoint)
- *  2. AgentRuntime.discoverAll() connects to each server and runs the full
- *     MCP handshake + discovery (tools, resources, prompts)
- *  3. A summary of everything discovered is printed
- *  4. The agent runs your question through the LLM ↔ MCP agentic loop
- *  5. The final answer is printed
- */
 public class Main {
 
     public static void main(String[] args) throws Exception {
 
         // ── Configuration ────────────────────────────────────────────────────
         String openAiKey = System.getenv("OPENAI_API_KEY");
-        if (openAiKey == null || openAiKey.isBlank()) {
-            throw new IllegalStateException(
-                "OPENAI_API_KEY environment variable is not set.");
-        }
+        if (openAiKey == null || openAiKey.isBlank())
+            throw new IllegalStateException("OPENAI_API_KEY environment variable is not set.");
+
+        // ── Planning mode ────────────────────────────────────────────────────
+        // SHORT: no planner call, executor self-directs with guardrails (fastest)
+        // MID  : cheap planner call gives budget+intent, executor self-directs (balanced)
+        // LONG : full planner with step list + per-step reflection (slowest, best quality)
+        PlanningMode mode = PlanningMode.SHORT;
+
+        // ── Debug flags ──────────────────────────────────────────────────────
+        AgentRuntime.DEBUG_MCP_RAW    = true;  // print raw data from MCP server calls
+        AgentRuntime.DEBUG_LLM_PROMPT = true;  // print system prompt sent to LLM
 
         // ── Shared HTTP client ───────────────────────────────────────────────
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
 
-        // ── MCP Clients (one per server endpoint) ────────────────────────────
+        // ── MCP Clients ───────────────────────────────────────────────────────
         MCPClient general = new MCPClient(
-            "https://content-retrival-ai-mcp.cfapps.eu10.hana.ondemand.com/general/mcp",
-            httpClient
-        );
+            "https://content-retrival-ai-mcp.cfapps.eu10.hana.ondemand.com/general/mcp", httpClient);
         MCPClient content = new MCPClient(
-            "https://content-retrival-ai-mcp.cfapps.eu10.hana.ondemand.com/content_retrival/mcp",
-            httpClient
-        );
+            "https://content-retrival-ai-mcp.cfapps.eu10.hana.ondemand.com/content_retrival/mcp", httpClient);
         MCPClient talentbot = new MCPClient(
-            "https://content-retrival-ai-mcp.cfapps.eu10.hana.ondemand.com/talentbot/mcp",
-            httpClient
-        );
+            "https://content-retrival-ai-mcp.cfapps.eu10.hana.ondemand.com/talentbot/mcp", httpClient);
 
-        // ── LLM Provider (OpenAI via raw HTTP – swap for any other provider) ─
-        LLMProvider llm = new OpenAIProvider(
-            "gpt-4o",       // model name
-            openAiKey,
-            httpClient
-        );
+        // ── LLM Provider ─────────────────────────────────────────────────────
+        LLMProvider llm = new OpenAIProvider("gpt-5.2", openAiKey, httpClient);
 
-        // ── Agent Runtime (self-discovery happens here) ──────────────────────
-        AgentRuntime agent = new AgentRuntime(
-            List.of(general, content, talentbot),
-            llm
-        );
+        // ── Planner ───────────────────────────────────────────────────────────
+        // SHORT mode: planner is created but plan() is a no-op (no LLM call)
+        // MID mode  : uses gpt-4.1-mini (cheap, fast)
+        // LONG mode : uses gpt-4.1 (full quality)
+        Planner planner = new Planner(mode, "gpt-4.1", openAiKey, httpClient);
 
-        // Print a full summary of everything discovered from all servers
+        // ── Agent Runtime ─────────────────────────────────────────────────────
+        AgentRuntime agent = new AgentRuntime(List.of(general, content, talentbot), llm, planner);
         agent.printDiscoverySummary();
 
-        // ── Run a query ───────────────────────────────────────────────────────
-        String question = "Hii How many tools and prompts do you have? What are they? Can you give me a  very very very short summary of each?";
+        // ── Run ───────────────────────────────────────────────────────────────
+        String question = "Hii I have a meeting to prepare for. Can you help me gather some information? "
+            + "and I want to have some insights and data points to share with my team."
+            + "The meeting is about the latest trends in content retrieval AI, **Meeting type**: decision + strategy + technical deep-dive, Audience: AIML Engineers, FrontEnd Developers and Product Managers, Duration: 1 hour. , "
+            + "Primary use case** (pick one or describe): enterprise docs/RAG"
+            + "and no more questions please";
         System.out.println("Question: " + question);
         System.out.println("─".repeat(60));
 
