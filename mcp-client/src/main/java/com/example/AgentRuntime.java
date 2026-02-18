@@ -13,22 +13,21 @@ import java.util.*;
 /**
  * AgentRuntime -- MCP agent with three planning modes and debug output.
  *
- * Planning modes:
- *   SHORT: No planner LLM call. Executor self-directs with guardrails.
- *          Anti-repeat guard prevents infinite loops.
- *   MID  : Cheap planner gives budget+intent. Executor runs freely within budget.
- *   LONG : Full planner with step list + per-step reflection.
- *
- * Debug flags (set in Main.java):
- *   DEBUG_MCP_RAW    -- print raw data from MCP server calls
- *   DEBUG_LLM_PROMPT -- print system prompt sent to LLM
+ * KEY FIX: MCP prompt templates (get_prompt__*) are no longer executed as
+ * observations in the agent loop. Instead they are DEFERRED -- their text
+ * content is extracted and injected directly as the system instruction for
+ * the final synthesise() call, so the LLM actually follows the prompt rather
+ * than summarising it as data.
  */
 public class AgentRuntime {
 
     private static final String RESPONSES_URL     = "https://api.openai.com/v1/responses";
     private static final String GET_PROMPT_PREFIX = "get_prompt__";
 
-    // Toggle these in Main.java before constructing AgentRuntime
+    // Sentinel prefix used internally to tag deferred prompt payloads
+    // so the executor loops can recognise and route them correctly.
+    private static final String DEFERRED_PROMPT_SENTINEL = "__DEFERRED_PROMPT__:";
+
     public static boolean DEBUG_MCP_RAW    = true;
     public static boolean DEBUG_LLM_PROMPT = true;
 
@@ -102,6 +101,7 @@ public class AgentRuntime {
         Set<String>               usedFingerprints = new HashSet<>();
         List<ReasoningStep>       trace            = new ArrayList<>();
         List<String>              history          = new ArrayList<>();
+        List<String>              collectedPrompts = new ArrayList<>(); // <-- deferred prompts
         List<LLMProvider.Message> messages         = new ArrayList<>();
         messages.add(new LLMProvider.Message("user", userQuestion));
 
@@ -125,7 +125,7 @@ public class AgentRuntime {
                 if (usedFingerprints.contains(fingerprint)) {
                     System.out.println("[Agent/SHORT]   SKIP duplicate: " + call.toolName());
                     toolResults.add(new LLMProvider.ToolResult(call.callId(),
-                        "[DUPLICATE] This exact call was already made. Do not repeat it. Try a different query or tool."));
+                        "[DUPLICATE] This exact call was already made. Do not repeat it."));
                     observations.add("[DUPLICATE SKIPPED]");
                     actionsTaken.add(call.toolName() + "(dup)");
                     continue;
@@ -133,12 +133,29 @@ public class AgentRuntime {
                 usedFingerprints.add(fingerprint);
                 System.out.println("[Agent/SHORT]   -> " + call.toolName());
                 actionsTaken.add(call.toolName());
+
                 String result = dispatch(call);
-                System.out.println("[Agent/SHORT]   <- " + result.length() + " chars");
-                observations.add(result);
-                toolResults.add(new LLMProvider.ToolResult(call.callId(), result));
-                history.add("OBSERVATION[" + call.toolName() + "]: "
-                    + (result.length() > 500 ? result.substring(0, 497) + "..." : result));
+
+                // ── KEY FIX: route deferred prompts away from observations ──
+                if (result.startsWith(DEFERRED_PROMPT_SENTINEL)) {
+                    String promptText = result.substring(DEFERRED_PROMPT_SENTINEL.length());
+                    collectedPrompts.add(promptText);
+                    System.out.println("[Agent/SHORT]   <- DEFERRED PROMPT collected ("
+                        + promptText.length() + " chars) -- will inject at synthesis");
+                    // Feed a neutral ack back to the executor so it doesn't
+                    // think the step failed and doesn't try to re-call it.
+                    toolResults.add(new LLMProvider.ToolResult(call.callId(),
+                        "[PROMPT TEMPLATE COLLECTED] The prompt template has been queued "
+                        + "for the final answer generation. Continue with any remaining "
+                        + "data-gathering tool calls if needed."));
+                    observations.add("[PROMPT DEFERRED TO SYNTHESIS]");
+                } else {
+                    System.out.println("[Agent/SHORT]   <- " + result.length() + " chars");
+                    observations.add(result);
+                    toolResults.add(new LLMProvider.ToolResult(call.callId(), result));
+                    history.add("OBSERVATION[" + call.toolName() + "]: "
+                        + (result.length() > 500 ? result.substring(0, 497) + "..." : result));
+                }
             }
 
             trace.add(new ReasoningStep(stepsUsed, String.join(", ", actionsTaken),
@@ -152,8 +169,11 @@ public class AgentRuntime {
         }
 
         System.out.println("\n[Agent/SHORT] Synthesising...");
+        if (!collectedPrompts.isEmpty())
+            System.out.println("[Agent/SHORT] Injecting " + collectedPrompts.size()
+                + " deferred MCP prompt(s) into synthesis.");
         printTrace(trace);
-        return synthesise(userQuestion, history);
+        return synthesise(userQuestion, history, collectedPrompts);
     }
 
     // ── MID execution ─────────────────────────────────────────────────────
@@ -162,6 +182,7 @@ public class AgentRuntime {
         Set<String>               usedFingerprints = new HashSet<>();
         List<ReasoningStep>       trace            = new ArrayList<>();
         List<String>              history          = new ArrayList<>();
+        List<String>              collectedPrompts = new ArrayList<>(); // <-- deferred prompts
         List<LLMProvider.Message> messages         = new ArrayList<>();
         messages.add(new LLMProvider.Message("user", userQuestion));
 
@@ -194,12 +215,26 @@ public class AgentRuntime {
                 usedFingerprints.add(fingerprint);
                 System.out.println("[Agent/MID]   -> " + call.toolName());
                 actionsTaken.add(call.toolName());
+
                 String result = dispatch(call);
-                System.out.println("[Agent/MID]   <- " + result.length() + " chars");
-                observations.add(result);
-                toolResults.add(new LLMProvider.ToolResult(call.callId(), result));
-                history.add("OBSERVATION[" + call.toolName() + "]: "
-                    + (result.length() > 500 ? result.substring(0, 497) + "..." : result));
+
+                // ── KEY FIX: route deferred prompts away from observations ──
+                if (result.startsWith(DEFERRED_PROMPT_SENTINEL)) {
+                    String promptText = result.substring(DEFERRED_PROMPT_SENTINEL.length());
+                    collectedPrompts.add(promptText);
+                    System.out.println("[Agent/MID]   <- DEFERRED PROMPT collected ("
+                        + promptText.length() + " chars) -- will inject at synthesis");
+                    toolResults.add(new LLMProvider.ToolResult(call.callId(),
+                        "[PROMPT TEMPLATE COLLECTED] Queued for final answer generation. "
+                        + "Continue with remaining data-gathering tool calls if needed."));
+                    observations.add("[PROMPT DEFERRED TO SYNTHESIS]");
+                } else {
+                    System.out.println("[Agent/MID]   <- " + result.length() + " chars");
+                    observations.add(result);
+                    toolResults.add(new LLMProvider.ToolResult(call.callId(), result));
+                    history.add("OBSERVATION[" + call.toolName() + "]: "
+                        + (result.length() > 500 ? result.substring(0, 497) + "..." : result));
+                }
             }
 
             trace.add(new ReasoningStep(stepsUsed, String.join(", ", actionsTaken),
@@ -213,8 +248,11 @@ public class AgentRuntime {
         }
 
         System.out.println("\n[Agent/MID] Synthesising...");
+        if (!collectedPrompts.isEmpty())
+            System.out.println("[Agent/MID] Injecting " + collectedPrompts.size()
+                + " deferred MCP prompt(s) into synthesis.");
         printTrace(trace);
-        return synthesise(userQuestion, history);
+        return synthesise(userQuestion, history, collectedPrompts);
     }
 
     // ── LONG execution ────────────────────────────────────────────────────
@@ -223,6 +261,7 @@ public class AgentRuntime {
         Set<String>               usedFingerprints = new HashSet<>();
         List<ReasoningStep>       trace            = new ArrayList<>();
         List<String>              history          = new ArrayList<>();
+        List<String>              collectedPrompts = new ArrayList<>(); // <-- deferred prompts
         List<LLMProvider.Message> messages         = new ArrayList<>();
         messages.add(new LLMProvider.Message("user", userQuestion));
 
@@ -259,12 +298,27 @@ public class AgentRuntime {
                 usedFingerprints.add(fingerprint);
                 System.out.println("[Agent/LONG]   -> " + call.toolName());
                 actionsTaken.add(call.toolName());
+
                 String result = dispatch(call);
-                System.out.println("[Agent/LONG]   <- " + result.length() + " chars");
-                observations.add(result);
-                toolResults.add(new LLMProvider.ToolResult(call.callId(), result));
-                history.add("OBSERVATION[" + call.toolName() + "]: "
-                    + (result.length() > 500 ? result.substring(0, 497) + "..." : result));
+
+                // ── KEY FIX: route deferred prompts away from observations ──
+                if (result.startsWith(DEFERRED_PROMPT_SENTINEL)) {
+                    String promptText = result.substring(DEFERRED_PROMPT_SENTINEL.length());
+                    collectedPrompts.add(promptText);
+                    System.out.println("[Agent/LONG]   <- DEFERRED PROMPT collected ("
+                        + promptText.length() + " chars) -- will inject at synthesis");
+                    toolResults.add(new LLMProvider.ToolResult(call.callId(),
+                        "[PROMPT TEMPLATE COLLECTED] Queued for final answer generation. "
+                        + "Continue with remaining data-gathering tool calls if needed."));
+                    observations.add("[PROMPT DEFERRED TO SYNTHESIS]");
+                    history.add("DEFERRED_PROMPT[" + call.toolName() + "]: collected");
+                } else {
+                    System.out.println("[Agent/LONG]   <- " + result.length() + " chars");
+                    observations.add(result);
+                    toolResults.add(new LLMProvider.ToolResult(call.callId(), result));
+                    history.add("OBSERVATION[" + call.toolName() + "]: "
+                        + (result.length() > 500 ? result.substring(0, 497) + "..." : result));
+                }
             }
 
             String reflection    = reflect(userQuestion, plan.intent(), history, remaining);
@@ -287,8 +341,11 @@ public class AgentRuntime {
         }
 
         System.out.println("\n[Agent/LONG] Synthesising...");
+        if (!collectedPrompts.isEmpty())
+            System.out.println("[Agent/LONG] Injecting " + collectedPrompts.size()
+                + " deferred MCP prompt(s) into synthesis.");
         printTrace(trace);
-        return synthesise(userQuestion, history);
+        return synthesise(userQuestion, history, collectedPrompts);
     }
 
     // ── Reflection (LONG only) ─────────────────────────────────────────────
@@ -330,25 +387,83 @@ public class AgentRuntime {
 
     // ── Synthesis ──────────────────────────────────────────────────────────
 
-    private String synthesise(String userQuestion, List<String> history) throws Exception {
-        StringBuilder ctx = new StringBuilder();
-        ctx.append("Answer the user's question using ONLY the information gathered below.\n");
-        ctx.append("Be comprehensive and well-structured. Do not invent facts.\n\n");
-        ctx.append("User question: ").append(userQuestion).append("\n\n");
-        ctx.append("Research gathered:\n");
+    /**
+     * Builds the final answer.
+     *
+     * When MCP prompt templates were collected during the agent loop,
+     * they are used as the SYSTEM INSTRUCTION for this call instead of the
+     * generic executor prompt. The research observations are appended as
+     * user-turn context so the LLM has all the gathered data it needs to
+     * actually fulfil the prompt's instructions.
+     *
+     * If multiple prompts were collected they are concatenated in order --
+     * the last one wins for overall structure but all constraints apply.
+     */
+    private String synthesise(String userQuestion,
+                              List<String> history,
+                              List<String> collectedPrompts) throws Exception {
+
+        // ── Build the context from observations ──────────────────────────────
+        StringBuilder obsContext = new StringBuilder();
         boolean hasObs = false;
         for (String h : history) {
             if (h.startsWith("OBSERVATION")) {
-                ctx.append(h).append("\n\n");
+                obsContext.append(h).append("\n\n");
                 hasObs = true;
             }
         }
+
+        // ── Case 1: MCP prompts were collected ──────────────────────────────
+        // Use the deferred prompt(s) as the system instruction.
+        // Append any gathered observations as grounding data.
+        if (!collectedPrompts.isEmpty()) {
+            StringBuilder systemInstruction = new StringBuilder();
+
+            // If multiple prompts collected, layer them in order
+            for (int i = 0; i < collectedPrompts.size(); i++) {
+                if (i > 0) systemInstruction.append("\n\n---\n\n");
+                systemInstruction.append(collectedPrompts.get(i));
+            }
+
+            // Append research gathered by other tools as grounding context
+            StringBuilder userMessage = new StringBuilder();
+            userMessage.append("Original user request: ").append(userQuestion).append("\n\n");
+            if (hasObs) {
+                userMessage.append("Research and data gathered by the agent:\n\n");
+                userMessage.append(obsContext);
+                userMessage.append("\nUsing the above research, fulfil the instructions in your system prompt.");
+            } else {
+                userMessage.append("Fulfil the instructions in your system prompt.");
+            }
+
+            if (DEBUG_LLM_PROMPT) {
+                printPromptBlock("SYNTHESIS SYSTEM (from MCP prompt)", systemInstruction.toString());
+                System.out.println("[Synthesise] User message length: "
+                    + userMessage.length() + " chars");
+            }
+
+            LLMProvider.LLMResponse r = llmProvider.chat(
+                systemInstruction.toString(),
+                List.of(new LLMProvider.Message("user", userMessage.toString())),
+                List.of());
+            return r.finalText() != null ? r.finalText() : "Could not synthesise a final answer.";
+        }
+
+        // ── Case 2: No MCP prompts -- standard synthesis ─────────────────────
         if (!hasObs) {
             // Model answered without needing tools
             return llmProvider.chat(executorSystemPrompt,
                 List.of(new LLMProvider.Message("user", userQuestion)), List.of())
                 .finalText();
         }
+
+        StringBuilder ctx = new StringBuilder();
+        ctx.append("Answer the user's question using ONLY the information gathered below.\n");
+        ctx.append("Be comprehensive and well-structured. Do not invent facts.\n\n");
+        ctx.append("User question: ").append(userQuestion).append("\n\n");
+        ctx.append("Research gathered:\n");
+        ctx.append(obsContext);
+
         LLMProvider.LLMResponse r = llmProvider.chat(
             executorSystemPrompt,
             List.of(new LLMProvider.Message("user", ctx.toString())),
@@ -356,66 +471,15 @@ public class AgentRuntime {
         return r.finalText() != null ? r.finalText() : "Could not synthesise a final answer.";
     }
 
-    // ── Prompt builders ────────────────────────────────────────────────────
-
-    private String buildShortExecutorPrompt(int remaining) {
-        return executorSystemPrompt + "\n\n"
-            + "## Self-Directed Execution Rules\n"
-            + "You decide what to do, but follow these guardrails:\n\n"
-            + "1. STEPS REMAINING: " + remaining + " -- do NOT exceed this.\n"
-            + "2. ASSESS COMPLEXITY: If the question is a greeting or simple fact,\n"
-            + "   answer immediately with NO tool calls.\n"
-            + "3. NO REPEATS: Never call the same tool with the same arguments twice.\n"
-            + "   If a search returned no results, change the query -- do not retry.\n"
-            + "4. STOP EARLY: As soon as you have enough info to answer, return it.\n"
-            + "5. EFFICIENCY: One focused tool call per step preferred.\n";
-    }
-
-    private String buildMidExecutorPrompt(Planner.Plan plan, int remaining) {
-        return executorSystemPrompt + "\n\n"
-            + "## Execution Context\n"
-            + "Goal: " + plan.intent() + "\n"
-            + "Complexity: " + plan.complexity() + "\n"
-            + "Steps remaining: " + remaining + "\n\n"
-            + "## Rules\n"
-            + "- Do NOT exceed " + remaining + " more tool-call turns.\n"
-            + "- Do NOT repeat a tool call with the same arguments.\n"
-            + "- Stop as soon as you have enough to answer the question.\n"
-            + "- One focused call per step.\n";
-    }
-
-    private String buildLongExecutorPrompt(Planner.Plan plan, List<String> history,
-                                           int used, int remaining, String lastReflection) {
-        StringBuilder sb = new StringBuilder(executorSystemPrompt);
-        sb.append("\n\n## Execution Plan\n");
-        sb.append("Goal: ").append(plan.intent()).append("\n");
-        sb.append("Steps used / budget: ").append(used).append(" / ").append(plan.stepBudget()).append("\n");
-        sb.append("Steps remaining: ").append(remaining).append("\n\n");
-        sb.append("### Planned steps:\n");
-        for (int i = 0; i < plan.plannedSteps().size(); i++)
-            sb.append(i + 1).append(". ").append(plan.plannedSteps().get(i)).append("\n");
-        if (!lastReflection.isBlank())
-            sb.append("\n### Last reflection:\n").append(lastReflection).append("\n");
-        sb.append("\n### Rules:\n");
-        sb.append("- Exactly ").append(remaining).append(" step(s) left -- respect this.\n");
-        sb.append("- Do NOT repeat any tool call with the same arguments.\n");
-        sb.append("- Return final answer immediately if you already have enough info.\n");
-        return sb.toString();
-    }
-
-    private String buildHistoryBlock(List<String> history) {
-        if (history.isEmpty()) return "";
-        StringBuilder sb = new StringBuilder("\n\n## What you have gathered so far:\n");
-        for (String h : history)
-            if (h.startsWith("OBSERVATION"))
-                sb.append(h, 0, Math.min(h.length(), 300)).append("\n");
-        return sb.toString();
-    }
-
     // ── Dispatch ───────────────────────────────────────────────────────────
 
-    // -- Dispatch ---------------------------------------------------------------
-
+    /**
+     * Routes a tool call to the correct MCP client.
+     *
+     * For get_prompt__* calls the returned value is wrapped with
+     * DEFERRED_PROMPT_SENTINEL so the executor loops know to collect
+     * the prompt text rather than treating it as an observation.
+     */
     private String dispatch(LLMProvider.ToolCall call) throws Exception {
         String name = call.toolName();
 
@@ -427,14 +491,22 @@ public class AgentRuntime {
             ObjectNode rawArgs = call.arguments().isObject()
                 ? (ObjectNode) call.arguments() : mapper.createObjectNode();
 
-            // Coerce LLM-supplied strings to declared types; strip empty optionals.
             ObjectNode coerced = coercePromptArgs(promptName, rawArgs);
             System.out.println("[Agent] prompts/get[" + promptName + "] args: " + coerced);
 
             JsonNode result = client.getPrompt(promptName, coerced);
             String pretty   = result.toPrettyString();
             if (DEBUG_MCP_RAW) printMcpResult("prompts/get[" + promptName + "]", pretty);
-            return pretty;
+
+            // ── Extract the prompt text and wrap with sentinel ────────────────
+            // MCP getPrompt returns an array of {role, content{type,text}} messages.
+            // We extract all text blocks and concatenate them as the actual prompt.
+            String extractedText = extractPromptText(result);
+
+            System.out.println("[Agent] Deferring prompt '" + promptName
+                + "' to synthesis (" + extractedText.length() + " chars).");
+
+            return DEFERRED_PROMPT_SENTINEL + extractedText;
         }
 
         MCPClient client = toolRegistry.get(name);
@@ -445,17 +517,62 @@ public class AgentRuntime {
     }
 
     /**
+     * Extracts all text content from the MCP prompt messages array.
+     *
+     * MCP prompts/get returns:
+     *   [ { "role": "user", "content": { "type": "text", "text": "..." } }, ... ]
+     *
+     * We concatenate all text blocks (preserving role context as comments
+     * if there are multiple roles) into a single string for use as a
+     * system instruction.
+     */
+    private String extractPromptText(JsonNode messagesArray) {
+        if (!messagesArray.isArray() || messagesArray.isEmpty()) {
+            return messagesArray.toString();
+        }
+
+        // Single message -- just return its text directly
+        if (messagesArray.size() == 1) {
+            return extractTextFromMessage(messagesArray.get(0));
+        }
+
+        // Multiple messages -- concatenate with role labels
+        StringBuilder sb = new StringBuilder();
+        for (JsonNode msg : messagesArray) {
+            String role = msg.path("role").asText("user");
+            String text = extractTextFromMessage(msg);
+            if (sb.length() > 0) sb.append("\n\n");
+            sb.append("[").append(role.toUpperCase()).append("]\n").append(text);
+        }
+        return sb.toString();
+    }
+
+    private String extractTextFromMessage(JsonNode msg) {
+        JsonNode contentNode = msg.path("content");
+
+        // content is an object: { "type": "text", "text": "..." }
+        if (contentNode.isObject()) {
+            return contentNode.path("text").asText(contentNode.toString());
+        }
+
+        // content is an array: [{ "type": "text", "text": "..." }, ...]
+        if (contentNode.isArray()) {
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode block : contentNode) {
+                if ("text".equals(block.path("type").asText())) {
+                    if (sb.length() > 0) sb.append("\n");
+                    sb.append(block.path("text").asText());
+                }
+            }
+            return sb.toString();
+        }
+
+        // content is a plain string
+        return contentNode.asText(msg.toString());
+    }
+
+    /**
      * Coerce LLM-supplied argument strings to the types the MCP server declared.
-     *
-     * The LLM always sends JSON strings. Servers using Pydantic reject:
-     *   - A string "42" where they expect integer
-     *   - An empty string "" where they expect a valid value
-     *
-     * This method:
-     *   1. Drops empty-string optional args (never send "" to the server)
-     *   2. Converts "42" -> 42 (integer) for args declared as integer/int/number
-     *   3. Converts "true"/"false" -> boolean for args declared as boolean
-     *   4. Passes required+empty args through so the server gives a clear error
      */
     private ObjectNode coercePromptArgs(String promptName, ObjectNode rawArgs) {
         ObjectNode coerced = mapper.createObjectNode();
@@ -465,16 +582,11 @@ public class AgentRuntime {
         JsonNode declaredArgs = meta.path("arguments");
         if (!declaredArgs.isArray()) return rawArgs;
 
-        // Build lookup maps from the declared argument metadata
         Map<String, String>  argTypes    = new LinkedHashMap<>();
         Map<String, Boolean> argRequired = new LinkedHashMap<>();
         for (JsonNode arg : declaredArgs) {
             String argName = arg.path("name").asText();
-            // MCP spec: arguments have name, description, required.
-            // The "type" hint comes from the inputSchema we built during discovery.
-            // Fall back to "string" for anything we do not recognise.
             String type = "string";
-            // Try to pick up type from the synthetic schema in toolDefinitions
             for (LLMProvider.ToolDefinition td : toolDefinitions) {
                 if (td.name().equals(GET_PROMPT_PREFIX + promptName) && td.inputSchema() != null) {
                     JsonNode propType = td.inputSchema().path("properties")
@@ -489,7 +601,6 @@ public class AgentRuntime {
             argRequired.put(argName, arg.path("required").asBoolean(false));
         }
 
-        // Walk the raw arguments the LLM provided
         rawArgs.fields().forEachRemaining(entry -> {
             String   key    = entry.getKey();
             JsonNode val    = entry.getValue();
@@ -497,13 +608,12 @@ public class AgentRuntime {
             String   type   = argTypes.getOrDefault(key, "string");
             boolean  req    = argRequired.getOrDefault(key, false);
 
-            // Drop empty optional args -- never send "" to the server
             if (strVal.isEmpty() || strVal.equalsIgnoreCase("null")) {
                 if (!req) {
                     System.out.println("[Coerce] Skipping empty optional arg: " + key);
                     return;
                 }
-                coerced.put(key, ""); // required but empty -- server will report missing
+                coerced.put(key, "");
                 return;
             }
 
@@ -534,7 +644,6 @@ public class AgentRuntime {
 
         return coerced;
     }
-
 
     // ── Discovery ──────────────────────────────────────────────────────────
 
@@ -583,9 +692,13 @@ public class AgentRuntime {
                 schema.set("properties", props);
                 if (!req.isEmpty()) schema.set("required", mapper.valueToTree(req));
 
-                toolRegistry.put(synName, client);
+                // Note: prompt calls go through promptRegistry, NOT toolRegistry
+                // We still register the synthetic tool definition so the LLM can call it
                 toolDefinitions.add(new LLMProvider.ToolDefinition(synName,
                     "Fetch the '" + promptName + "' prompt template from MCP server. "
+                        + "NOTE: This prompt will be used to structure the FINAL ANSWER, "
+                        + "not as intermediate research. Call it when you know the parameters "
+                        + "and want to apply a specific output format or instruction set. "
                         + prompt.path("description").asText(""),
                     schema));
             }
@@ -632,12 +745,14 @@ public class AgentRuntime {
 
         if (!promptRegistry.isEmpty()) {
             sb.append("## Available Prompt Templates\n");
-            sb.append("These are pre-built prompt templates on the MCP server.\n");
-            sb.append("To use one, call its corresponding get_prompt__ tool.\n\n");
+            sb.append("These templates STRUCTURE THE FINAL ANSWER -- they are NOT data sources.\n");
+            sb.append("When you call a get_prompt__ tool:\n");
+            sb.append("  1. The template is DEFERRED and injected at final answer generation.\n");
+            sb.append("  2. You should STILL use data tools to gather research first.\n");
+            sb.append("  3. The final LLM call will follow the template's instructions.\n\n");
             promptMeta.forEach((name, meta) -> {
                 sb.append("- **").append(name).append("**");
                 String desc = meta.path("description").asText("").trim();
-                // Include FULL description so LLM understands what the prompt does
                 if (!desc.isBlank()) sb.append(":\n  ").append(desc.replace("\n", "\n  "));
                 sb.append("\n");
                 sb.append("  Call tool: get_prompt__").append(name).append("\n");
@@ -657,6 +772,63 @@ public class AgentRuntime {
             });
         }
 
+        return sb.toString();
+    }
+
+    // ── Prompt builders ────────────────────────────────────────────────────
+
+    private String buildShortExecutorPrompt(int remaining) {
+        return executorSystemPrompt + "\n\n"
+            + "## Self-Directed Execution Rules\n"
+            + "1. STEPS REMAINING: " + remaining + " -- do NOT exceed this.\n"
+            + "2. If the question is a greeting or simple fact, answer immediately with NO tool calls.\n"
+            + "3. NO REPEATS: Never call the same tool with the same arguments twice.\n"
+            + "4. STOP EARLY: As soon as you have enough info to answer, return it.\n"
+            + "5. EFFICIENCY: One focused tool call per step preferred.\n"
+            + "6. PROMPT TEMPLATES: Call get_prompt__* tools early to set output structure,\n"
+            + "   then use data tools to gather the research they need.\n";
+    }
+
+    private String buildMidExecutorPrompt(Planner.Plan plan, int remaining) {
+        return executorSystemPrompt + "\n\n"
+            + "## Execution Context\n"
+            + "Goal: " + plan.intent() + "\n"
+            + "Complexity: " + plan.complexity() + "\n"
+            + "Steps remaining: " + remaining + "\n\n"
+            + "## Rules\n"
+            + "- Do NOT exceed " + remaining + " more tool-call turns.\n"
+            + "- Do NOT repeat a tool call with the same arguments.\n"
+            + "- Stop as soon as you have enough to answer the question.\n"
+            + "- One focused call per step.\n"
+            + "- PROMPT TEMPLATES: call get_prompt__* early; they shape final output, not research.\n";
+    }
+
+    private String buildLongExecutorPrompt(Planner.Plan plan, List<String> history,
+                                           int used, int remaining, String lastReflection) {
+        StringBuilder sb = new StringBuilder(executorSystemPrompt);
+        sb.append("\n\n## Execution Plan\n");
+        sb.append("Goal: ").append(plan.intent()).append("\n");
+        sb.append("Steps used / budget: ").append(used).append(" / ").append(plan.stepBudget()).append("\n");
+        sb.append("Steps remaining: ").append(remaining).append("\n\n");
+        sb.append("### Planned steps:\n");
+        for (int i = 0; i < plan.plannedSteps().size(); i++)
+            sb.append(i + 1).append(". ").append(plan.plannedSteps().get(i)).append("\n");
+        if (!lastReflection.isBlank())
+            sb.append("\n### Last reflection:\n").append(lastReflection).append("\n");
+        sb.append("\n### Rules:\n");
+        sb.append("- Exactly ").append(remaining).append(" step(s) left -- respect this.\n");
+        sb.append("- Do NOT repeat any tool call with the same arguments.\n");
+        sb.append("- Return final answer immediately if you already have enough info.\n");
+        sb.append("- PROMPT TEMPLATES: call get_prompt__* early; they shape final output, not research.\n");
+        return sb.toString();
+    }
+
+    private String buildHistoryBlock(List<String> history) {
+        if (history.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder("\n\n## What you have gathered so far:\n");
+        for (String h : history)
+            if (h.startsWith("OBSERVATION"))
+                sb.append(h, 0, Math.min(h.length(), 300)).append("\n");
         return sb.toString();
     }
 
